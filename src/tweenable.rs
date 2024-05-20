@@ -836,7 +836,7 @@ impl<T> Tweenable<T> for Sequence<T> {
         self.elapsed = self.elapsed.saturating_add(delta).min(self.duration);
         while self.index < self.tweens.len() {
             let tween = &mut self.tweens[self.index];
-            let tween_remaining = tween.duration() - tween.elapsed();
+            let tween_remaining = tween.duration().mul_f32(1.0 - tween.progress());
             if let TweenState::Active = tween.tick(delta, target, entity, events) {
                 return TweenState::Active;
             }
