@@ -214,9 +214,11 @@ pub use lens::Lens;
 #[cfg(feature = "bevy_asset")]
 pub use plugin::asset_animator_system;
 pub use plugin::{component_animator_system, AnimationSystem, TweeningPlugin};
+#[cfg(feature = "bevy_asset")]
+pub use tweenable::AssetTarget;
 pub use tweenable::{
-    BoxedTweenable, Delay, Sequence, Targetable, TotalDuration, Tracks, Tween, TweenCompleted,
-    TweenState, Tweenable,
+    BoxedTweenable, ComponentTarget, Delay, Sequence, Targetable, TotalDuration, Tracks, Tween,
+    TweenCompleted, TweenState, Tweenable,
 };
 
 pub mod lens;
@@ -226,12 +228,23 @@ mod tweenable;
 #[cfg(test)]
 mod test_utils;
 
-/// How many times to repeat a tween animation. See also: [`RepeatStrategy`].
+/// How many times to repeat a tweenable animation.
+///
+/// See also [`RepeatStrategy`].
+///
+/// Default: `Finite(1)`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepeatCount {
-    /// Run the animation N times.
+    /// Run the animation an exact number of times.
+    ///
+    /// The total playback duration is the tweenable animation duration times
+    /// this number of iterations.
     Finite(u32),
-    /// Run the animation for some amount of time.
+    /// Run the animation for some duration.
+    ///
+    /// If this duration is not a multiple of the tweenable animation duration,
+    /// then the animation will get stopped midway through its playback,
+    /// possibly even before finishing a single loop.
     For(Duration),
     /// Loop the animation indefinitely.
     Infinite,
@@ -255,13 +268,18 @@ impl From<Duration> for RepeatCount {
     }
 }
 
-/// What to do when a tween animation needs to be repeated. See also
-/// [`RepeatCount`].
+/// What to do when a tween animation needs to be repeated.
 ///
 /// Only applicable when [`RepeatCount`] is greater than the animation duration.
+///
+/// Default: `Repeat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepeatStrategy {
     /// Reset the animation back to its starting position.
+    ///
+    /// When playback reaches the end of the animation, it jumps directly back
+    /// to the animation start. This can create discontinuities if the animation
+    /// is not authored to be looping.
     Repeat,
     /// Follow a ping-pong pattern, changing the direction each time an endpoint
     /// is reached.
@@ -270,6 +288,9 @@ pub enum RepeatStrategy {
     /// iterations for the various operations where looping matters. That
     /// is, a 1 second animation will take 2 seconds to end up back where it
     /// started.
+    ///
+    /// This strategy ensures that there's no discontinuity in the animation,
+    /// since there's no jump.
     MirroredRepeat,
 }
 
@@ -280,6 +301,8 @@ impl Default for RepeatStrategy {
 }
 
 /// Playback state of an animator.
+///
+/// Default: `Playing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnimatorState {
     /// The animation is playing. This is the default state.
@@ -306,14 +329,25 @@ impl std::ops::Not for AnimatorState {
 }
 
 /// Describe how eased value should be computed.
+///
+/// This function is applied to the animation fraction `t` representing the
+/// playback position over the animation duration. The result is used to
+/// interpolate the animator target.
+///
+/// In general a [`Lens`] should perform a linear interpolation over its target,
+/// and the non-linear behavior (for example, bounciness, etc.) comes from this
+/// function. This ensures the same [`Lens`] can be reused in multiple contexts,
+/// while the "shape" of the animation is controlled independently.
+///
+/// Default: `Linear`.
 #[derive(Clone, Copy)]
 pub enum EaseMethod {
-    /// Follow `EaseFunction`.
+    /// Follow [`EaseFunction`].
     EaseFunction(EaseFunction),
-    /// Linear interpolation, with no function.
+    /// Linear interpolation.
     Linear,
-    /// Discrete interpolation, eased value will jump from start to end when
-    /// stepping over the discrete limit.
+    /// Discrete interpolation. The eased value will jump from start to end when
+    /// stepping over the discrete limit, which must be value between 0 and 1.
     Discrete(f32),
     /// Use a custom function to interpolate the value.
     CustomFunction(fn(f32) -> f32),
@@ -365,6 +399,8 @@ impl From<EaseFunction> for EaseMethod {
 /// value set. When using [`RepeatStrategy::MirroredRepeat`], this is either
 /// forward (from start to end; ping) or backward (from end to start; pong),
 /// depending on the current iteration of the loop.
+///
+/// Default: `Forward`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TweeningDirection {
     /// Animation playing from start to end.
@@ -537,26 +573,12 @@ impl<T: Asset> AssetAnimator<T> {
     animator_impl!();
 }
 
-/// Trait to interpolate between two values.
-/// Needed for color.
-#[allow(dead_code)]
-trait ColorLerper {
-    fn lerp(&self, target: &Self, ratio: f32) -> Self;
-}
-
-#[allow(dead_code)]
-impl ColorLerper for Color {
-    fn lerp(&self, target: &Color, ratio: f32) -> Color {
-        let r = self.r().lerp(target.r(), ratio);
-        let g = self.g().lerp(target.g(), ratio);
-        let b = self.b().lerp(target.b(), ratio);
-        let a = self.a().lerp(target.a(), ratio);
-        Color::rgba(r, g, b, a)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use bevy::ecs::component::Tick;
+
+    use self::tweenable::ComponentTarget;
+
     use super::*;
     use crate::test_utils::*;
 
@@ -565,7 +587,7 @@ mod tests {
         end: f32,
     }
 
-    #[derive(Debug, Default, Component)]
+    #[derive(Debug, Default, Clone, Copy, Component)]
     struct DummyComponent {
         value: f32,
     }
@@ -577,7 +599,7 @@ mod tests {
     }
 
     impl Lens<DummyComponent> for DummyLens {
-        fn lerp(&mut self, target: &mut DummyComponent, ratio: f32) {
+        fn lerp(&mut self, target: &mut dyn Targetable<DummyComponent>, ratio: f32) {
             target.value = self.start.lerp(self.end, ratio);
         }
     }
@@ -587,14 +609,29 @@ mod tests {
         let mut c = DummyComponent::default();
         let mut l = DummyLens { start: 0., end: 1. };
         for r in [0_f32, 0.01, 0.3, 0.5, 0.9, 0.999, 1.] {
-            l.lerp(&mut c, r);
+            {
+                let mut added = Tick::new(0);
+                let mut last_changed = Tick::new(0);
+                let mut target = ComponentTarget::new(Mut::new(
+                    &mut c,
+                    &mut added,
+                    &mut last_changed,
+                    Tick::new(0),
+                    Tick::new(1),
+                ));
+
+                l.lerp(&mut target, r);
+
+                assert!(target.to_mut().is_changed());
+            }
+
             assert_approx_eq!(c.value, r);
         }
     }
 
     #[cfg(feature = "bevy_asset")]
     impl Lens<DummyAsset> for DummyLens {
-        fn lerp(&mut self, target: &mut DummyAsset, ratio: f32) {
+        fn lerp(&mut self, target: &mut dyn Targetable<DummyAsset>, ratio: f32) {
             target.value = self.start.lerp(self.end, ratio);
         }
     }
@@ -602,11 +639,28 @@ mod tests {
     #[cfg(feature = "bevy_asset")]
     #[test]
     fn dummy_lens_asset() {
-        let mut a = DummyAsset::default();
+        use self::tweenable::AssetTarget;
+
+        let mut assets = Assets::<DummyAsset>::default();
+        let handle = assets.add(DummyAsset::default());
+
         let mut l = DummyLens { start: 0., end: 1. };
         for r in [0_f32, 0.01, 0.3, 0.5, 0.9, 0.999, 1.] {
-            l.lerp(&mut a, r);
-            assert_approx_eq!(a.value, r);
+            {
+                let mut added = Tick::new(0);
+                let mut last_changed = Tick::new(0);
+                let mut target = AssetTarget::new(Mut::new(
+                    &mut assets,
+                    &mut added,
+                    &mut last_changed,
+                    Tick::new(0),
+                    Tick::new(0),
+                ));
+                target.handle = handle.clone();
+
+                l.lerp(&mut target, r);
+            }
+            assert_approx_eq!(assets.get(handle.id()).unwrap().value, r);
         }
     }
 
