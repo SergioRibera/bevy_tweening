@@ -2323,4 +2323,35 @@ mod tests {
         let transform = world.entity(entity).get::<Transform>().unwrap();
         assert!(transform.translation.abs_diff_eq(Vec3::ZERO, 1e-5)); // no-op, rewind doesn't apply Lens
     }
+
+    #[test]
+    fn tick_mirrored_seq() {
+        let tween1 = Tween::new(
+            EaseMethod::Linear,
+            Duration::from_secs(1),
+            TransformPositionLens {
+                start: Vec3::ZERO,
+                end: Vec3::ONE,
+            },
+        );
+        let tween2 = Tween::new(
+            EaseMethod::Linear,
+            Duration::from_secs(1),
+            TransformRotationLens {
+                start: Quat::IDENTITY,
+                end: Quat::from_rotation_x(90_f32.to_radians()),
+            },
+        )
+        .with_repeat_count(RepeatCount::Infinite)
+        .with_repeat_strategy(RepeatStrategy::MirroredRepeat);
+
+        let mut seq = tween1.then(tween2);
+        let (mut world, entity) = make_test_env();
+
+        for i in 0..200 {
+            let duration = Duration::from_millis(200);
+            println!("{:?}", i);
+            manual_tick_component(duration, &mut seq, &mut world, entity);
+        }
+    }
 }
