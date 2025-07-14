@@ -791,10 +791,16 @@ impl<T> Tweenable<T> for Tween<T> {
         // If completed at least once this frame, notify the user
         if times_completed > 0 {
             if let Some(user_data) = &self.event_data {
-                events.send(TweenCompleted {
+                let event = TweenCompleted {
                     entity,
                     user_data: *user_data,
-                });
+                };
+
+                // send regular event
+                events.send(event);
+
+                // trigger all entity-scoped observers
+                commands.trigger_targets(event, entity);
             }
             if let Some(cb) = &self.on_completed {
                 cb(entity, self);
@@ -842,11 +848,17 @@ impl<T> Sequence<T> {
     pub fn new(items: impl IntoIterator<Item = impl Into<BoxedTweenable<T>>>) -> Self {
         let tweens: Vec<_> = items.into_iter().map(Into::into).collect();
         assert!(!tweens.is_empty());
+
         let duration = tweens
             .iter()
-            .map(AsRef::as_ref)
-            .map(Tweenable::duration)
+            .map(|tween| match tween.total_duration() {
+                TotalDuration::Finite(duration) => duration,
+                TotalDuration::Infinite => {
+                    unimplemented!("Infinite durations are not supported in Sequence")
+                }
+            })
             .sum();
+
         Self {
             tweens,
             index: 0,
@@ -1321,10 +1333,16 @@ impl<T> Tweenable<T> for Delay<T> {
         // If completed this frame, notify the user
         if (state == TweenState::Completed) && !was_completed {
             if let Some(user_data) = &self.event_data {
-                events.send(TweenCompleted {
+                let event = TweenCompleted {
                     entity,
                     user_data: *user_data,
-                });
+                };
+
+                // send regular event
+                events.send(event);
+
+                // trigger all entity-scoped observers
+                commands.trigger_targets(event, entity);
             }
             if let Some(cb) = &self.on_completed {
                 cb(entity, self);
@@ -1346,7 +1364,13 @@ impl<T> Tweenable<T> for Delay<T> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use bevy::ecs::{component::Tick, event::Events, system::SystemState, world::CommandQueue};
+    use bevy::ecs::{
+        change_detection::MaybeLocation,
+        component::{Mutable, Tick},
+        event::Events,
+        system::SystemState,
+        world::CommandQueue,
+    };
 
     use super::*;
     use crate::{lens::*, test_utils::*};
@@ -1382,7 +1406,7 @@ mod tests {
     fn oneshot_test() {}
 
     /// Manually tick a test tweenable targeting a component.
-    fn manual_tick_component<T: Component>(
+    fn manual_tick_component<T: Component<Mutability = Mutable>>(
         duration: Duration,
         tween: &mut dyn Tweenable<T>,
         world: &mut World,
@@ -1416,12 +1440,14 @@ mod tests {
         let mut c = DummyComponent::default();
         let mut added = Tick::new(0);
         let mut last_changed = Tick::new(0);
+        let mut caller = MaybeLocation::caller();
         let mut target = ComponentTarget::new(Mut::new(
             &mut c,
             &mut added,
             &mut last_changed,
             Tick::new(0),
             Tick::new(1),
+            caller.as_mut(),
         ));
         let mut target = target.to_mut();
 

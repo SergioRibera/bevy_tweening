@@ -1,4 +1,4 @@
-use bevy::prelude::*;
+use bevy::{ecs::component::Mutable, prelude::*};
 
 #[cfg(feature = "bevy_asset")]
 use crate::{tweenable::AssetTarget, AssetAnimator};
@@ -27,11 +27,11 @@ use crate::{tweenable::ComponentTarget, Animator, AnimatorState, TweenCompleted}
 /// add manually the relevant systems for the exact set of components and assets
 /// actually animated.
 ///
-/// [`Transform`]: https://docs.rs/bevy/0.15.0/bevy/transform/components/struct.Transform.html
-/// [`TextColor`]: https://docs.rs/bevy/0.15.0/bevy/text/struct.TextColor.html
-/// [`Node`]: https://docs.rs/bevy/0.15.0/bevy/ui/struct.Node.html
-/// [`Sprite`]: https://docs.rs/bevy/0.15.0/bevy/sprite/struct.Sprite.html
-/// [`ColorMaterial`]: https://docs.rs/bevy/0.15.0/bevy/sprite/struct.ColorMaterial.html
+/// [`Transform`]: https://docs.rs/bevy/0.16.0/bevy/transform/components/struct.Transform.html
+/// [`TextColor`]: https://docs.rs/bevy/0.16.0/bevy/text/struct.TextColor.html
+/// [`Node`]: https://docs.rs/bevy/0.16.0/bevy/ui/struct.Node.html
+/// [`Sprite`]: https://docs.rs/bevy/0.16.0/bevy/sprite/struct.Sprite.html
+/// [`ColorMaterial`]: https://docs.rs/bevy/0.16.0/bevy/sprite/struct.ColorMaterial.html
 #[derive(Debug, Clone, Copy)]
 pub struct TweeningPlugin;
 
@@ -85,16 +85,21 @@ pub enum AnimationSystem {
 ///
 /// This system extracts all components of type `T` with an [`Animator<T>`]
 /// attached to the same entity, and tick the animator to animate the component.
-pub fn component_animator_system<T: Component>(
+pub fn component_animator_system<T: Component<Mutability = Mutable>>(
     time: Res<Time>,
-    mut query: Query<(Entity, &mut T, &mut Animator<T>)>,
+    mut animator_query: Query<(Entity, &mut Animator<T>)>,
+    mut target_query: Query<&mut T>,
     events: ResMut<Events<TweenCompleted>>,
     mut commands: Commands,
 ) {
     let mut events: Mut<Events<TweenCompleted>> = events.into();
-    for (entity, target, mut animator) in query.iter_mut() {
+    for (animator_entity, mut animator) in animator_query.iter_mut() {
         if animator.state != AnimatorState::Paused {
             let speed = animator.speed();
+            let entity = animator.target.unwrap_or(animator_entity);
+            let Ok(target) = target_query.get_mut(entity) else {
+                continue;
+            };
             let mut target = ComponentTarget::new(target);
             animator.tweenable_mut().tick(
                 time.delta().mul_f32(speed),
@@ -158,13 +163,16 @@ mod tests {
         },
     };
 
+    use bevy::ecs::component::Mutable;
+
     use crate::{lens::TransformPositionLens, *};
 
     /// A simple isolated test environment with a [`World`] and a single
     /// [`Entity`] in it.
     struct TestEnv<T: Component> {
         world: World,
-        entity: Entity,
+        animator_entity: Entity,
+        target_entity: Option<Entity>,
         _phantom: PhantomData<T>,
     }
 
@@ -180,13 +188,31 @@ mod tests {
 
             Self {
                 world,
-                entity,
+                animator_entity: entity,
+                target_entity: None,
+                _phantom: PhantomData,
+            }
+        }
+
+        /// Like [`TestEnv::new`], but the component is placed on a separate entity.
+        pub fn new_separated(animator: Animator<T>) -> Self {
+            let mut world = World::new();
+            world.init_resource::<Events<TweenCompleted>>();
+            world.init_resource::<Time>();
+
+            let target = world.spawn(T::default()).id();
+            let entity = world.spawn(animator.with_target(target)).id();
+
+            Self {
+                world,
+                animator_entity: entity,
+                target_entity: Some(target),
                 _phantom: PhantomData,
             }
         }
     }
 
-    impl<T: Component> TestEnv<T> {
+    impl<T: Component<Mutability = Mutable>> TestEnv<T> {
         /// Get the test world.
         pub fn world_mut(&mut self) -> &mut World {
             &mut self.world
@@ -215,12 +241,17 @@ mod tests {
 
         /// Get the animator for the component.
         pub fn animator(&self) -> &Animator<T> {
-            self.world.entity(self.entity).get::<Animator<T>>().unwrap()
+            self.world
+                .entity(self.animator_entity)
+                .get::<Animator<T>>()
+                .unwrap()
         }
 
         /// Get the component.
         pub fn component_mut(&mut self) -> Mut<T> {
-            self.world.get_mut::<T>(self.entity).unwrap()
+            self.world
+                .get_mut::<T>(self.target_entity.unwrap_or(self.animator_entity))
+                .unwrap()
         }
 
         /// Get the emitted event count since last tick.
@@ -228,6 +259,30 @@ mod tests {
             let events = self.world.resource::<Events<TweenCompleted>>();
             events.get_cursor().len(events)
         }
+    }
+
+    #[test]
+    fn custom_target_entity() {
+        let tween = Tween::new(
+            EaseMethod::EaseFunction(EaseFunction::Linear),
+            Duration::from_secs(1),
+            TransformPositionLens {
+                start: Vec3::ZERO,
+                end: Vec3::ONE,
+            },
+        )
+        .with_completed_event(0);
+        let mut env = TestEnv::new_separated(Animator::new(tween));
+        let mut system = IntoSystem::into_system(component_animator_system::<Transform>);
+        system.initialize(env.world_mut());
+
+        env.tick(Duration::ZERO, &mut system);
+        let transform = env.component_mut();
+        assert!(transform.translation.abs_diff_eq(Vec3::ZERO, 1e-5));
+
+        env.tick(Duration::from_millis(500), &mut system);
+        let transform = env.component_mut();
+        assert!(transform.translation.abs_diff_eq(Vec3::splat(0.5), 1e-5));
     }
 
     #[test]
